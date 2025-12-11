@@ -1,0 +1,389 @@
+-- BanManager (ModuleScript)
+-- ServerScriptService/BanManager
+-- bans ppl who are MOST LIKELY hacking
+-- =what ts does: Ban, Unban, IsBanned, GetBanInfo, KickNow, ApplyPunishment, LoadOnPlayerJoin
+
+local DataStoreService = game:GetService("DataStoreService")
+local ServerStorage = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Try to load config (non-fatal)
+local okCfg, Config = pcall(function()
+	return require(ReplicatedStorage:WaitForChild("AC_Config"))
+end)
+if not okCfg then
+	Config = {
+		DataStore = { BanStore = "KaffeinsAC_Bans_v1" },
+	}
+end
+
+local BanManager = {}
+local banStore
+local inMemory = {} -- [userId] = info
+
+-- Reason list: canonical reason keys -> message & default punishment
+-- punishment: "kick" | "tempban" | "permban"
+BanManager.ReasonList = {
+	WalkspeedTooFast = {
+		message = "Your WalkSpeed was too high — punishment: kick",
+		punishment = "kick"
+	},
+	FlyHackDetected = {
+		message = "Flight detected — punishment: kick",
+		punishment = "kick"
+	},
+	TeleportExploit = {
+		message = "Unauthorized teleport detected — punishment: tempban",
+		punishment = "tempban"
+	},
+	RemoteSpam = {
+		message = "Abusing RemoteEvents — punishment: tempban",
+		punishment = "tempban"
+	},
+	SevereExploit = {
+		message = "Severe exploit detected — punishment: permaban",
+		punishment = "permban"
+	},
+	Other = {
+		message = "You were removed from the game — reason not specified",
+		punishment = "kick"
+	},
+}
+
+-- Attempt to get DataStore (may fail in Studio)
+local okDS, ds = pcall(function()
+	return DataStoreService:GetDataStore(Config.DataStore and Config.DataStore.BanStore or "KaffeinsAC_Bans_v1")
+end)
+if okDS then banStore = ds else banStore = nil end
+
+-- Ensure ServerStorage folders
+local function ensureFolders()
+	local acData = ServerStorage:FindFirstChild("AC_Data")
+	if not acData then
+		acData = Instance.new("Folder")
+		acData.Name = "AC_Data"
+		acData.Parent = ServerStorage
+	end
+	local banData = acData:FindFirstChild("BanData")
+	if not banData then
+		banData = Instance.new("Folder")
+		banData.Name = "BanData"
+		banData.Parent = acData
+	end
+	if not banData:FindFirstChild("TempBans") then
+		local f = Instance.new("Folder")
+		f.Name = "TempBans"
+		f.Parent = banData
+	end
+	if not banData:FindFirstChild("PermBans") then
+		local f = Instance.new("Folder")
+		f.Name = "PermBans"
+		f.Parent = banData
+	end
+end
+ensureFolders()
+
+local function serverBanPath()
+	local acData = ServerStorage:FindFirstChild("AC_Data")
+	if not acData then return nil end
+	return acData:FindFirstChild("BanData")
+end
+
+-- Write structured info to ServerStorage (Folder per-user)
+local function writeServerStorageBan(userId, info)
+	local banPath = serverBanPath()
+	if not banPath then return end
+	local tempFolder = banPath:FindFirstChild("TempBans")
+	local permFolder = banPath:FindFirstChild("PermBans")
+	if not tempFolder or not permFolder then return end
+
+	local uidName = tostring(userId)
+	-- Clear existing
+	local existingTemp = tempFolder:FindFirstChild(uidName)
+	if existingTemp then existingTemp:Destroy() end
+	local existingPerm = permFolder:FindFirstChild(uidName)
+	if existingPerm then existingPerm:Destroy() end
+
+	-- Create folder representation for both temp & perm (makes reading consistent)
+	local f = Instance.new("Folder")
+	f.Name = uidName
+	if info.expiresAt and type(info.expiresAt) == "number" then
+		f.Parent = tempFolder
+	else
+		f.Parent = permFolder
+	end
+
+	local sv = Instance.new("StringValue"); sv.Name = "ReasonType"; sv.Value = tostring(info.reasonType or "Other"); sv.Parent = f
+	local mv = Instance.new("StringValue"); mv.Name = "Message"; mv.Value = tostring(info.message or ""); mv.Parent = f
+	local pv = Instance.new("StringValue"); pv.Name = "Punishment"; pv.Value = tostring(info.punishment or "kick"); pv.Parent = f
+	local bv = Instance.new("NumberValue"); bv.Name = "BannedAt"; bv.Value = tonumber(info.bannedAt) or os.time(); bv.Parent = f
+	if info.expiresAt then
+		local ev = Instance.new("NumberValue"); ev.Name = "ExpiresAt"; ev.Value = info.expiresAt; ev.Parent = f
+	end
+end
+
+local function removeServerStorageBan(userId)
+	local banPath = serverBanPath()
+	if not banPath then return end
+	local tempFolder = banPath:FindFirstChild("TempBans")
+	local permFolder = banPath:FindFirstChild("PermBans")
+	local uidName = tostring(userId)
+	if tempFolder and tempFolder:FindFirstChild(uidName) then tempFolder:FindFirstChild(uidName):Destroy() end
+	if permFolder and permFolder:FindFirstChild(uidName) then permFolder:FindFirstChild(uidName):Destroy() end
+end
+
+-- DataStore helpers (best-effort)
+local function datastoreSave(userId, info)
+	if not banStore then return false, "no_datastore" end
+	local key = tostring(userId)
+	local ok, err = pcall(function()
+		banStore:SetAsync(key, info)
+	end)
+	return ok, err
+end
+
+local function datastoreRemove(userId)
+	if not banStore then return false, "no_datastore" end
+	local key = tostring(userId)
+	local ok, err = pcall(function()
+		banStore:RemoveAsync(key)
+	end)
+	return ok, err
+end
+
+local function datastoreLoad(userId)
+	if not banStore then return nil, "no_datastore" end
+	local key = tostring(userId)
+	local ok, data = pcall(function()
+		return banStore:GetAsync(key)
+	end)
+	if not ok then return nil, data end
+	return data
+end
+
+-- Internal helper to normalize reason info
+local function buildInfoForReason(reasonType, durationSeconds)
+	local reasonDef = BanManager.ReasonList[reasonType] or BanManager.ReasonList.Other
+	local now = os.time()
+	local expiresAt = nil
+	if durationSeconds and tonumber(durationSeconds) and tonumber(durationSeconds) > 0 then
+		expiresAt = now + tonumber(durationSeconds)
+	end
+	local info = {
+		reasonType = reasonType or "Other",
+		message = reasonDef.message or tostring(reasonType or "Other"),
+		punishment = reasonDef.punishment or "kick",
+		bannedAt = now,
+		expiresAt = expiresAt,
+	}
+	return info
+end
+
+-- PUBLIC API
+
+-- Ban(userId, reasonType, durationSeconds)
+-- If punishment is "kick" and durationSeconds is nil or 0, this will still record info but
+-- callers usually should call KickNow to perform an immediate kick. We store any non-kick bans.
+function BanManager.Ban(userId, reasonType, durationSeconds)
+	userId = tonumber(userId)
+	if not userId then return false, "invalid_userid" end
+
+	local info = buildInfoForReason(reasonType, durationSeconds)
+
+	-- decide whether to persist: persist if it's a ban (temp or perm)
+	if info.punishment == "kick" and (not info.expiresAt) then
+		-- Kick-only: do not persist as a lasting ban; just store ephemeral in memory for audit.
+		inMemory[userId] = info
+		-- do not write to DataStore or ServerStorage for pure kick-only events
+		return true, info
+	end
+
+	-- Persist in-memory & ServerStorage, and attempt DataStore save
+	inMemory[userId] = info
+	pcall(writeServerStorageBan, userId, info)
+	local ok, err = datastoreSave(userId, info)
+	if not ok then
+		warn("[BanManager] DataStore save failed for user", userId, err)
+	end
+	return true, info
+end
+
+-- Unban(userId)
+function BanManager.Unban(userId)
+	userId = tonumber(userId)
+	if not userId then return false, "invalid_userid" end
+	inMemory[userId] = nil
+	removeServerStorageBan(userId)
+	local ok, err = datastoreRemove(userId)
+	if not ok then
+		warn("[BanManager] DataStore remove failed:", err)
+	end
+	return true
+end
+
+-- IsBanned(userId) -> (bool, infoOrNil)
+function BanManager.IsBanned(userId)
+	userId = tonumber(userId)
+	if not userId then return false end
+
+	-- check memory cache
+	local cached = inMemory[userId]
+	if cached then
+		-- expired?
+		if cached.expiresAt and os.time() > cached.expiresAt then
+			inMemory[userId] = nil
+			removeServerStorageBan(userId)
+			pcall(datastoreRemove, userId)
+			return false
+		end
+		return true, cached
+	end
+
+	-- check ServerStorage (fast)
+	local banPath = serverBanPath()
+	if banPath then
+		local tempFolder = banPath:FindFirstChild("TempBans")
+		local permFolder = banPath:FindFirstChild("PermBans")
+		local uidName = tostring(userId)
+		local folder = nil
+		if permFolder and permFolder:FindFirstChild(uidName) then
+			folder = permFolder:FindFirstChild(uidName)
+		elseif tempFolder and tempFolder:FindFirstChild(uidName) then
+			folder = tempFolder:FindFirstChild(uidName)
+		end
+		if folder then
+			-- read values
+			local reasonTypeObj = folder:FindFirstChild("ReasonType")
+			local msgObj = folder:FindFirstChild("Message")
+			local punObj = folder:FindFirstChild("Punishment")
+			local bannedAtObj = folder:FindFirstChild("BannedAt")
+			local expiresObj = folder:FindFirstChild("ExpiresAt")
+
+			local info = {
+				reasonType = reasonTypeObj and reasonTypeObj.Value or "Other",
+				message = msgObj and msgObj.Value or "",
+				punishment = punObj and punObj.Value or "kick",
+				bannedAt = bannedAtObj and bannedAtObj.Value or os.time(),
+				expiresAt = expiresObj and expiresObj.Value or nil
+			}
+
+			-- check expiry
+			if info.expiresAt and os.time() > info.expiresAt then
+				-- expired -> cleanup
+				removeServerStorageBan(userId)
+				pcall(datastoreRemove, userId)
+				return false
+			end
+
+			-- cache
+			inMemory[userId] = info
+			return true, info
+		end
+	end
+
+	-- fallback: try DataStore
+	local dsData, dsErr = datastoreLoad(userId)
+	if dsData and type(dsData) == "table" then
+		-- expiry check
+		if dsData.expiresAt and os.time() > dsData.expiresAt then
+			pcall(datastoreRemove, userId)
+			return false
+		end
+		inMemory[userId] = dsData
+		pcall(writeServerStorageBan, userId, dsData)
+		return true, dsData
+	end
+
+	return false
+end
+
+-- GetBanInfo(userId) -> info table or nil
+function BanManager.GetBanInfo(userId)
+	userId = tonumber(userId)
+	if not userId then return nil end
+	return inMemory[userId] or nil
+end
+
+-- Kick the player immediately with the reason message (no persistence)
+function BanManager.KickNow(player, reasonType)
+	if not player then return false, "no_player" end
+	local reasonDef = BanManager.ReasonList[reasonType] or BanManager.ReasonList.Other
+	local msg = reasonDef.message or "You were kicked."
+	pcall(function() player:Kick("[KaffeinsAC] " .. msg) end)
+	return true
+end
+
+-- ApplyPunishment: convenience. Accepts player object or userId.
+-- If punishment is kick and durationSeconds nil/0 -> immediate kick (no persistence).
+-- If punishment is tempban/permban -> persists and (if player present) kicks them.
+function BanManager.ApplyPunishment(target, reasonType, durationSeconds)
+	-- target can be a player object or a numeric userId
+	local playerObj = nil
+	local userId = nil
+	if typeof(target) == "Instance" then
+		playerObj = target
+		userId = playerObj.UserId
+	else
+		userId = tonumber(target)
+	end
+
+	local reasonDef = BanManager.ReasonList[reasonType] or BanManager.ReasonList.Other
+	local punishment = reasonDef.punishment or "kick"
+
+	-- If punishment is kick and no duration -> immediate non-persistent kick
+	if punishment == "kick" and (not durationSeconds or tonumber(durationSeconds) == 0) then
+		if playerObj then
+			BanManager.KickNow(playerObj, reasonType)
+			-- record ephemeral in memory for a short time for auditing
+			inMemory[userId] = buildInfoForReason(reasonType, 0)
+		end
+		return true
+	end
+
+	-- Otherwise create/persist ban
+	local ok, infoOrErr = BanManager.Ban(userId, reasonType, durationSeconds)
+	if not ok then
+		return false, infoOrErr
+	end
+
+	-- if player present, kick with message
+	if playerObj then
+		local info = infoOrErr
+		local msg = info.message or "You were banned."
+		pcall(function() playerObj:Kick("[KaffeinsAC] " .. msg) end)
+	end
+
+	return true
+end
+
+-- LoadOnPlayerJoin: call when player joins to load any persisted ban info
+function BanManager.LoadOnPlayerJoin(player)
+	local userId = player.UserId
+	-- prefer in-memory/ServerStorage checks via IsBanned
+	local isB, info = BanManager.IsBanned(userId)
+	if isB then
+		-- return structured info (used by BanEnforcer)
+		return true, info
+	end
+	return false
+end
+
+-- Admin helper: list perm bans from ServerStorage
+function BanManager.ListPermBans()
+	local out = {}
+	local banPath = serverBanPath()
+	if not banPath then return out end
+	local perm = banPath:FindFirstChild("PermBans")
+	if not perm then return out end
+	for _, v in ipairs(perm:GetChildren()) do
+		if v:IsA("Folder") then
+			local msg = v:FindFirstChild("Message") and v.Message.Value or ""
+			out[v.Name] = msg
+		elseif v:IsA("StringValue") then
+			out[v.Name] = v.Value
+		end
+	end
+	return out
+end
+
+return BanManager
